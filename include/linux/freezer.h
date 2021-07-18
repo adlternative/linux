@@ -164,7 +164,8 @@ static inline bool freezer_should_skip(struct task_struct *p)
  * task to be frozen. Note that neither return any clear indication of
  * whether a freeze event happened while in this function.
  */
-
+/* 这些函数旨在在您希望冻结睡眠任务时使用。 请注意，两者都不返回任何明确的指示，
+表明在此函数中是否发生了冻结事件。 */
 /* Like schedule(), but should not block the freezer. */
 static inline void freezable_schedule(void)
 {

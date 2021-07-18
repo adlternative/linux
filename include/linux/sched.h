@@ -194,6 +194,7 @@ struct task_group;
 #define __set_current_state(state_value)				\
 	WRITE_ONCE(current->__state, (state_value))
 
+/* 存 state_value 进程状态到 进程结构体中 有内存屏障 mb 防止乱序 */
 #define set_current_state(state_value)					\
 	smp_store_mb(current->__state, (state_value))
 

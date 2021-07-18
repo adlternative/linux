@@ -53,5 +53,7 @@ extern size_t strlcat(char *, const char *, size_t);
 
 /* Copied from linux/compiler-gcc.h since we can't include it directly */
 #define barrier() __asm__ __volatile__("": : :"memory")
-
+/*
+* 上述定义中，“__asm__”表示插入了汇编语言程序，“__volatile__”表示阻止编译器对该值进行优化，
+* 确保变量使用了用户定义的精确地址，而不是装有同一信息的一些别名。“memory”表示指令修改了内存单元。 */
 #endif

@@ -99,6 +99,7 @@ extern void sched_exec(void);
 #define sched_exec()   {}
 #endif
 
+/* 添加进程的引用计数 */
 static inline struct task_struct *get_task_struct(struct task_struct *t)
 {
 	refcount_inc(&t->usage);
@@ -106,15 +107,18 @@ static inline struct task_struct *get_task_struct(struct task_struct *t)
 }
 
 extern void __put_task_struct(struct task_struct *t);
-
+/* put_task_struct() 减少引用计数 如果没有引用了则释放进程内核栈
+和thread_info结构所占的页*/
 static inline void put_task_struct(struct task_struct *t)
 {
+  /* 引用计数减少 1 并测试它是否为 0 */
 	if (refcount_dec_and_test(&t->usage))
 		__put_task_struct(t);
 }
 
 static inline void put_task_struct_many(struct task_struct *t, int nr)
 {
+  /* 引用计数减少 nr 并测试它是否为 0 */
 	if (refcount_sub_and_test(nr, &t->usage))
 		__put_task_struct(t);
 }

@@ -57,16 +57,26 @@
  * it enqueues itself into the hash bucket, releases the hash bucket lock
  * and schedules.
  *
+ * waiter 读取用户空间中的 futex 值并调用 futex_wait()。
+ * 该函数计算哈希桶并获取哈希桶锁。 之后它再次读取 futex 用户空间值并验证数据没有改变。
+ * 如果它没有改变，它会将自己加入到哈希桶，释放哈希桶锁并执行调度。
+ * 个人理解：WAIT 的时候 判断 futex 值是否和指定的值相等，相等则等待，不等则错误返回。
  * The waker side modifies the user space value of the futex and calls
  * futex_wake(). This function computes the hash bucket and acquires the
  * hash bucket lock. Then it looks for waiters on that futex in the hash
  * bucket and wakes them.
  *
+ * 唤醒端修改futex的用户空间值，调用futex_wake()。 该函数计算哈希桶并获取哈希桶锁。
+ * 然后它在哈希桶中寻找那个 futex 上的等待者并唤醒他们。
  * In futex wake up scenarios where no tasks are blocked on a futex, taking
  * the hb spinlock can be avoided and simply return. In order for this
  * optimization to work, ordering guarantees must exist so that the waiter
  * being added to the list is acknowledged when the list is concurrently being
  * checked by the waker, avoiding scenarios like the following:
+ *
+ * 在 futex 唤醒场景 并且在 futex 上没有任务进程被阻塞 中，可以避免使用 hb 自旋锁并简单地返回。
+ * 为了使此优化起作用，必须存在顺序上的保证，以便在唤醒器同时检查列表时确认添加到列表中的等待者，
+ * 避免出现以下情况：
  *
  * CPU 0                               CPU 1
  * val = *futex;
@@ -88,10 +98,15 @@
  * missed the transition of the user space value from val to newval
  * and the waker did not find the waiter in the hash bucket queue.
  *
+ * 这将导致 CPU 0 上的等待程序永远等待，因为它
+ * 错过了用户空间值从 val 到 newval 的转换
+ * 并且唤醒者在哈希桶队列中没有找到等待者。
  * The correct serialization ensures that a waiter either observes
  * the changed user space value before blocking or is woken by a
  * concurrent waker:
  *
+ * 正确的序列化可确保等待者要么在阻塞之前观察到更改的用户空间值，
+ * 要么被并发唤醒器唤醒
  * CPU 0                                 CPU 1
  * val = *futex;
  * sys_futex(WAIT, futex, val);
@@ -116,10 +131,13 @@
  *   else                                    wake_waiters(futex);
  *     waiters--; (b)                        unlock(hash_bucket(futex));
  *
+ * 读者注：smp_mb() 适用于多处理器的内存屏障，mfence 包括读和写
  * Where (A) orders the waiters increment and the futex value read through
  * atomic operations (see hb_waiters_inc) and where (B) orders the write
  * to futex and the waiters read (see hb_waiters_pending()).
  *
+ * 其中（A）命令通过原子操作（参见 hb_waiters_inc）读取等待者增量和读取 futex 值，
+ * 其中（B）命令写入 futex 和等待者读取（参见 hb_waiters_pending()）。
  * This yields the following case (where X:=waiters, Y:=futex):
  *
  *	X = Y = 0
@@ -132,16 +150,23 @@
  * the guarantee that we cannot both miss the futex variable change and the
  * enqueue.
  *
+ * 保证 x==0 && y==0 是不可能的； 这又转化为保证我们不会错过 futex 变量更改和入队。
+ * 读者注：顺序一致性
  * Note that a new waiter is accounted for in (a) even when it is possible that
  * the wait call can return error, in which case we backtrack from it in (b).
  * Refer to the comment in queue_lock().
  *
+ * 请注意，即使等待调用可能会返回错误，在 (a) 中也会考虑新的等待者，在这种情况下，
+ * 我们在 (b) 中从它回溯。 请参阅 queue_lock() 中的注释。
  * Similarly, in order to account for waiters being requeued on another
  * address we always increment the waiters for the destination bucket before
  * acquiring the lock. It then decrements them again  after releasing it -
  * the code that actually moves the futex(es) between hash buckets (requeue_futex)
  * will do the additional required waiter count housekeeping. This is done for
  * double_lock_hb() and double_unlock_hb(), respectively.
+ * 同样，为了解决在另一个地址上重新排队的等待者，我们总是在获取锁之前增加目标存储桶的等待者。
+ * 然后在释放它后再次递减它们 - 实际在哈希桶（requeue_futex）之间移动 futex（es）的代码将执行
+ * 额外所需的等待者计数工作。 这是分别为 double_lock_hb() 和 double_unlock_hb() 完成的。
  */
 
 #ifdef CONFIG_HAVE_FUTEX_CMPXCHG
@@ -169,6 +194,14 @@ static int  __read_mostly futex_cmpxchg_enabled;
 /*
  * Priority Inheritance state:
  */
+/* 优先继承状态 PI 就是 Priority Inheritance 由于优先级反转问题，内核采取了
+ * 优先级继承的方法。
+ * 优先级继承是当任务A 申请共享资源S 时， 如果S正在被任务C 使用，通过比较任务C
+ * 与自身的优先级，如发现任务C 的优先级小于自身的优先级， 则将任务C的优先级提升到自身的优先级，
+ * 任务C 释放资源S 后，再恢复任务C 的原优先级。
+ * 这种方法只在占有资源的低优先级任务阻塞了高优先级任务时才动态的改变任务的优先级，
+ * 如果过程较复杂， 则需要进行判断。
+ */
 struct futex_pi_state {
 	/*
 	 * list of 'owned' pi_state instances - these have to be
@@ -189,25 +222,31 @@ struct futex_pi_state {
 
 /**
  * struct futex_q - The hashed futex queue entry, one per waiting task
- * @list:		priority-sorted list of tasks waiting on this futex
- * @task:		the task waiting on the futex
- * @lock_ptr:		the hash bucket lock
- * @key:		the key the futex is hashed on
- * @pi_state:		optional priority inheritance state
- * @rt_waiter:		rt_waiter storage for use with requeue_pi
- * @requeue_pi_key:	the requeue_pi target futex key
- * @bitset:		bitset for the optional bitmasked wakeup
+ * @list:		priority-sorted list of tasks waiting on this futex 等待在 futex 上的任务优先链表
+ * @task:		the task waiting on the futex 等待在 futex 上的任务
+ * @lock_ptr:		the hash bucket lock 哈希桶锁
+ * @key:		the key the futex is hashed on futex  futex 被哈希出的键
+ * @pi_state:		optional priority inheritance state 可选的优先继承状态
+ * @rt_waiter:		rt_waiter storage for use with requeue_pi 使用 requeue_pi 时的 rt_waiter
+ * @requeue_pi_key:	the requeue_pi target futex key requeue_pi 时的目标 futex 键
+ * @bitset:		bitset for the optional bitmasked wakeup 可选的 bitmasked wakeup
  *
  * We use this hashed waitqueue, instead of a normal wait_queue_entry_t, so
  * we can wake only the relevant ones (hashed queues may be shared).
  *
+ * 我们使用这个散列的 waitqueue，而不是普通的wait_queue_entry_t，所以我们只能唤醒相关的那些
+ *（散列队列可能是共享的）。
  * A futex_q has a woken state, just like tasks have TASK_RUNNING.
  * It is considered woken when plist_node_empty(&q->list) || q->lock_ptr == 0.
  * The order of wakeup is always to make the first condition true, then
  * the second.
+ * futex_q 有一个唤醒状态，就像任务有 TASK_RUNNING 一样。
+ * 当 plist_node_empty(&q->list) || 时被认为唤醒 q->lock_ptr == 0。唤醒的顺序总是使第一个条件成立，
+ * 然后是第二个。
  *
  * PI futexes are typically woken before they are removed from the hash list via
  * the rt_mutex code. See unqueue_me_pi().
+ * PI futex 通常在通过 rt_mutex 代码？从哈希列表中删除之前被唤醒。 参见 unqueue_me_pi()。
  */
 struct futex_q {
 	struct plist_node list;
@@ -232,17 +271,19 @@ static const struct futex_q futex_q_init = {
  * location.  Each key may have multiple futex_q structures, one for each task
  * waiting on a futex.
  */
+/* 哈希桶 */
 struct futex_hash_bucket {
 	atomic_t waiters;
 	spinlock_t lock;
 	struct plist_head chain;
-} ____cacheline_aligned_in_smp;
+} ____cacheline_aligned_in_smp; /* 缓存行对齐 */
 
 /*
  * The base of the bucket array and its size are always used together
  * (after initialization only in hash_futex()), so ensure that they
  * reside in the same cacheline.
  */
+/* __futex_data 哈希标 */
 static struct {
 	struct futex_hash_bucket *queues;
 	unsigned long            hashsize;
@@ -317,11 +358,11 @@ static void compat_exit_robust_list(struct task_struct *curr);
 static inline void hb_waiters_inc(struct futex_hash_bucket *hb)
 {
 #ifdef CONFIG_SMP
-	atomic_inc(&hb->waiters);
+	atomic_inc(&hb->waiters); /* waiter++ */
 	/*
 	 * Full barrier (A), see the ordering comment above.
 	 */
-	smp_mb__after_atomic();
+	smp_mb__after_atomic(); /* mb 读写内存屏障 */
 #endif
 }
 
@@ -332,18 +373,19 @@ static inline void hb_waiters_inc(struct futex_hash_bucket *hb)
 static inline void hb_waiters_dec(struct futex_hash_bucket *hb)
 {
 #ifdef CONFIG_SMP
-	atomic_dec(&hb->waiters);
+	atomic_dec(&hb->waiters); /* waiter-- */
 #endif
 }
 
+/* 返回哈希桶上的等待者数量 */
 static inline int hb_waiters_pending(struct futex_hash_bucket *hb)
 {
 #ifdef CONFIG_SMP
 	/*
 	 * Full barrier (B), see the ordering comment above.
 	 */
-	smp_mb();
-	return atomic_read(&hb->waiters);
+	smp_mb(); /* 读写内存屏障 */
+	return atomic_read(&hb->waiters); /* 读取 futex */
 #else
 	return 1;
 #endif
@@ -356,6 +398,7 @@ static inline int hb_waiters_pending(struct futex_hash_bucket *hb)
  * We hash on the keys returned from get_futex_key (see below) and return the
  * corresponding hash bucket in the global hash.
  */
+/* 算 key 在哈希表中对应是哪一个桶 */
 static struct futex_hash_bucket *hash_futex(union futex_key *key)
 {
 	u32 hash = jhash2((u32 *)key, offsetof(typeof(*key), both.offset) / 4,
@@ -372,6 +415,7 @@ static struct futex_hash_bucket *hash_futex(union futex_key *key)
  *
  * Return 1 if two futex_keys are equal, 0 otherwise.
  */
+/* 两个key */
 static inline int match_futex(union futex_key *key1, union futex_key *key2)
 {
 	return (key1 && key2
@@ -432,6 +476,7 @@ futex_setup_timer(ktime_t *time, struct hrtimer_sleeper *timeout,
  * for PI futexes that can mess up the state. The above argues that false-negatives
  * are only possible for malformed programs.
  */
+/* 为这个 inode 生成一个机器范围的唯一标识符。 */
 static u64 get_inode_sequence_number(struct inode *inode)
 {
 	static atomic64_t i_seq;
@@ -1444,6 +1489,7 @@ static int futex_lock_pi_atomic(u32 __user *uaddr, struct futex_hash_bucket *hb,
  *
  * The q->lock_ptr must not be NULL and must be held by the caller.
  */
+/* 将 q 从哈希桶上的优先链表中删除 */
 static void __unqueue_futex(struct futex_q *q)
 {
 	struct futex_hash_bucket *hb;
@@ -1463,14 +1509,16 @@ static void __unqueue_futex(struct futex_q *q)
  * must ensure to later call wake_up_q() for the actual
  * wakeups to occur.
  */
+/* 将 q 对应进程 加入到 wake_q 唤醒队列中*/
 static void mark_wake_futex(struct wake_q_head *wake_q, struct futex_q *q)
 {
 	struct task_struct *p = q->task;
 
 	if (WARN(q->pi_state || q->rt_waiter, "refusing to wake PI futex\n"))
 		return;
-
+  /* 添加进程引用计数 */
 	get_task_struct(p);
+  /* 将 q 从哈希桶上的优先链表中删除 */
 	__unqueue_futex(q);
 	/*
 	 * The waiting task can free the futex_q as soon as q->lock_ptr = NULL
@@ -1485,6 +1533,7 @@ static void mark_wake_futex(struct wake_q_head *wake_q, struct futex_q *q)
 	 * Queue the task for later wakeup for after we've released
 	 * the hb->lock.
 	 */
+  /* 向 wake_q 中添加了 q 对应的进程 */
 	wake_q_add_safe(wake_q, p);
 }
 
@@ -1586,33 +1635,35 @@ double_unlock_hb(struct futex_hash_bucket *hb1, struct futex_hash_bucket *hb2)
 }
 
 /*
- * Wake up waiters matching bitset queued on this futex (uaddr).
+ * Pre Wake up waiters matching bitset queued on this futex (uaddr).
  */
 static int
-futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
+prepare_wake_q(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset,
+  struct wake_q_head *wake_q)
 {
 	struct futex_hash_bucket *hb;
 	struct futex_q *this, *next;
 	union futex_key key = FUTEX_KEY_INIT;
 	int ret;
-	DEFINE_WAKE_Q(wake_q);
 
 	if (!bitset)
 		return -EINVAL;
-
+  /* 寻找 futex 对应的 key */
 	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &key, FUTEX_READ);
 	if (unlikely(ret != 0))
 		return ret;
-
+  /* 获取 key 对应的哈希桶 */
 	hb = hash_futex(&key);
 
 	/* Make sure we really have tasks to wakeup */
+  /* 如果哈希桶桑没有等待者...那么谁也不需要被唤醒 */
 	if (!hb_waiters_pending(hb))
 		return ret;
-
+  /* 加上哈希桶的自旋锁 */
 	spin_lock(&hb->lock);
-
+  /* 遍历这个哈系桶上的优先链表 */
 	plist_for_each_entry_safe(this, next, &hb->chain, list) {
+    /* 如果匹配到的是同一个 key */
 		if (match_futex (&this->key, &key)) {
 			if (this->pi_state || this->rt_waiter) {
 				ret = -EINVAL;
@@ -1622,16 +1673,39 @@ futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
 			/* Check if one of the bits is set in both bitsets */
 			if (!(this->bitset & bitset))
 				continue;
-
-			mark_wake_futex(&wake_q, this);
+      /* 将 this 添加到唤醒队列 wake_q 中 */
+			mark_wake_futex(wake_q, this);
+      /* ret此时为0 递增至 nr_wake 最大唤醒进程数量退出 */
 			if (++ret >= nr_wake)
 				break;
 		}
 	}
 
 	spin_unlock(&hb->lock);
-	wake_up_q(&wake_q);
 	return ret;
+}
+
+/*
+ * Wake up waiters matching bitset queued on this futex (uaddr).
+ */
+/*
+ * 原本的逻辑：
+ * 1. 找到uaddr对应的futex_hash_bucket，即代码中的hb
+ * 2. 对hb加自旋锁
+ * 3. 遍历fb的链表，找到uaddr对应的节点
+ * 4. 调用wake_futex唤起等待的进程
+ * 5. 释放自旋锁
+ */
+static int
+futex_wake(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
+{
+    int ret;
+    DEFINE_WAKE_Q(wake_q);
+
+    ret = prepare_wake_q(uaddr, flags, nr_wake, bitset, &wake_q);
+    wake_up_q(&wake_q);
+
+    return ret;
 }
 
 static int futex_atomic_op_inuser(unsigned int encoded_op, u32 __user *uaddr)
@@ -2190,11 +2264,12 @@ out_unlock:
 }
 
 /* The key must be already stored in q->key. */
+/* 加上哈希桶锁 */
 static inline struct futex_hash_bucket *queue_lock(struct futex_q *q)
 	__acquires(&hb->lock)
 {
 	struct futex_hash_bucket *hb;
-
+  /* 找到 q 对应的哈系桶 */
 	hb = hash_futex(&q->key);
 
 	/*
@@ -2205,14 +2280,20 @@ static inline struct futex_hash_bucket *queue_lock(struct futex_q *q)
 	 * decrement the counter at queue_unlock() when some error has
 	 * occurred and we don't end up adding the task to the list.
 	 */
+  /*
+   * 在获取锁之前递增计数器，以便潜在的唤醒者不会错过等待自旋锁的待睡眠任务。
+   * 这是安全的，因为所有 queue_lock() 用户最终都会调用 queue_me()。 类似地，
+   * 对于内务管理，当发生某些错误并且我们最终不会将任务添加到列表时，
+   * 在 queue_unlock() 处递减计数器。 */
 	hb_waiters_inc(hb); /* implies smp_mb(); (A) */
 
 	q->lock_ptr = &hb->lock;
-
+  /* 自旋 */
 	spin_lock(&hb->lock);
 	return hb;
 }
 
+/* 解开哈希桶锁 */
 static inline void
 queue_unlock(struct futex_hash_bucket *hb)
 	__releases(&hb->lock)
@@ -2233,9 +2314,11 @@ static inline void __queue_me(struct futex_q *q, struct futex_hash_bucket *hb)
 	 * Thus, all RT-threads are woken first in priority order, and
 	 * the others are woken last, in FIFO order.
 	 */
+  /* 优先级是 当前线程的优先级和 MAX_RT_PRIO 的最小值 */
 	prio = min(current->normal_prio, MAX_RT_PRIO);
-
+  /* 初始化优先链表节点 并 设置优先级 */
 	plist_node_init(&q->list, prio);
+  /* 添加到桶上 */
 	plist_add(&q->list, &hb->chain);
 	q->task = current;
 }
@@ -2267,8 +2350,8 @@ static inline void queue_me(struct futex_q *q, struct futex_hash_bucket *hb)
  * be paired with exactly one earlier call to queue_me().
  *
  * Return:
- *  - 1 - if the futex_q was still queued (and we removed unqueued it);
- *  - 0 - if the futex_q was already removed by the waking thread
+ *  - 1 - if the futex_q was still queued (and we removed unqueued it); 仍然在队列中则删去
+ *  - 0 - if the futex_q was already removed by the waking thread 已经被删去
  */
 static int unqueue_me(struct futex_q *q)
 {
@@ -2572,8 +2655,9 @@ static int fixup_owner(u32 __user *uaddr, struct futex_q *q, int locked)
  * @q:		the futex_q to queue up on
  * @timeout:	the prepared hrtimer_sleeper, or null for no timeout
  */
+/* 将当前的进程 q 插入到等待哈希桶中，等待 超时 或者 被唤醒 */
 static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
-				struct hrtimer_sleeper *timeout)
+				struct hrtimer_sleeper *timeout, struct task_struct *next)
 {
 	/*
 	 * The task state is guaranteed to be set before another task can
@@ -2581,10 +2665,13 @@ static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
 	 * queue_me() calls spin_unlock() upon completion, both serializing
 	 * access to the hash list and forcing another memory barrier.
 	 */
+  /* 将当前进程状态改为 TASK_INTERRUPTIBLE */
 	set_current_state(TASK_INTERRUPTIBLE);
+  /* 将当前的进程 q 插入到等待哈希桶中  */
 	queue_me(q, hb);
 
 	/* Arm the timer */
+  /* 设置定时器超时 */
 	if (timeout)
 		hrtimer_sleeper_start_expires(timeout, HRTIMER_MODE_ABS);
 
@@ -2592,20 +2679,47 @@ static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
 	 * If we have been removed from the hash list, then another task
 	 * has tried to wake us, and we can skip the call to schedule().
 	 */
+  /* 如果我们已经从哈希列表中删除，那么另一个任务试图唤醒我们，
+  我们可以跳过对 schedule() 的调用。 */
 	if (likely(!plist_node_empty(&q->list))) {
 		/*
 		 * If the timer has already expired, current will already be
 		 * flagged for rescheduling. Only call schedule if there
 		 * is no timeout, or if it has yet to expire.
 		 */
-		if (!timeout || timeout->task)
+    /* 如果定时器已经超时，当前任务将会已经被标记为重新调度 */
+		if (!timeout || timeout->task) {
+			if (next) {
+				/*
+				 * wake_up_process() below will be replaced
+				 * in the next patch with
+				 * wake_up_process_prefer_current_cpu().
+				 */
+        /* 如果计时器已经到期，则当前将被标记为重新安排。
+        *仅在没有超时或尚未到期时才调用 schedule。
+        */
+        /* 读者感觉是如果定时器超时了，那么就唤醒next进程 */
+				wake_up_process(next);
+        /* 减少引用计数 ？*/
+				put_task_struct(next);
+				next = NULL;
+			}
+      /* 与 schedule() 类似，但不应阻塞 freezer ?*/
 			freezable_schedule();
+    }
 	}
+  /* 设置cpu 状态为运行 */
 	__set_current_state(TASK_RUNNING);
+
+  if (next) {
+  		/* Maybe call wake_up_process_prefer_current_cpu()? */
+  		wake_up_process(next);
+  		put_task_struct(next);
+  }
 }
 
 /**
- * futex_wait_setup() - Prepare to wait on a futex
+ * futex_wait_setup() - Prepare to wait on a futex 准备等待 futex
  * @uaddr:	the futex userspace address
  * @val:	the expected value
  * @flags:	futex flags (FLAGS_SHARED, etc.)
@@ -2617,6 +2731,8 @@ static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
  * Return with the hb lock held and a q.key reference on success, and unlocked
  * with no q.key reference on failure.
  *
+ * 设置futex_q并定位hash_bucket。 获取futex值并将其与期望值进行比较。
+ * 在内部处理原子故障。 成功时返回持有 hb 锁和 q.key 引用，失败时解锁没有 q.key 引用。
  * Return:
  *  -  0 - uaddr contains val and hb has been locked;
  *  - <1 - -EFAULT or -EWOULDBLOCK (uaddr does not contain val) and hb is unlocked
@@ -2640,10 +2756,16 @@ static int futex_wait_setup(u32 __user *uaddr, u32 val, unsigned int flags,
 	 * would open a race condition where we could block indefinitely with
 	 * cond(var) false, which would violate the guarantee.
 	 *
+   * futex 的基本逻辑保证是，只有在任何条件下，在阻塞时已知 cond(var) 为真时，
+   * 它才会阻塞。 如果我们在测试 *uaddr 后锁定哈希桶，那将打开一个竞争条件，
+   * 我们可以使用 cond(var) false 无限期地阻塞，这将违反保证。
 	 * On the other hand, we insert q and release the hash-bucket only
 	 * after testing *uaddr.  This guarantees that futex_wait() will NOT
 	 * absorb a wakeup if *uaddr does not match the desired values
 	 * while the syscall executes.
+   *
+   * 另一方面，我们只有在测试 *uaddr 之后才插入 q 并释放 hash-bucket。
+   * 这保证了 futex_wait() 不会在系统调用执行时 *uaddr 与所需值不匹配时“吸收”唤醒。
 	 */
 retry:
 	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &q->key, FUTEX_READ);
@@ -2651,6 +2773,7 @@ retry:
 		return ret;
 
 retry_private:
+  /* 获得自旋锁 */
 	*hb = queue_lock(q);
 
 	ret = get_futex_value_locked(&uval, uaddr);
@@ -2667,7 +2790,7 @@ retry_private:
 
 		goto retry;
 	}
-
+  /* futex 的值不是 val (说明别的进程修改了 uval 的值) 那么就返回错误 */
 	if (uval != val) {
 		queue_unlock(*hb);
 		ret = -EWOULDBLOCK;
@@ -2677,7 +2800,7 @@ retry_private:
 }
 
 static int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val,
-		      ktime_t *abs_time, u32 bitset)
+		      ktime_t *abs_time, u32 bitset,  struct task_struct *next)
 {
 	struct hrtimer_sleeper timeout, *to;
 	struct restart_block *restart;
@@ -2688,7 +2811,7 @@ static int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val,
 	if (!bitset)
 		return -EINVAL;
 	q.bitset = bitset;
-
+  /* 设置定时器 */
 	to = futex_setup_timer(abs_time, &timeout, flags,
 			       current->timer_slack_ns);
 retry:
@@ -2696,16 +2819,21 @@ retry:
 	 * Prepare to wait on uaddr. On success, holds hb lock and increments
 	 * q.key refs.
 	 */
+  /* 该函数中判断uaddr指向的值是否等于 val，以及一些初始化操作 */
 	ret = futex_wait_setup(uaddr, val, flags, &q, &hb);
+  /* 如果val发生了改变，则直接返回 (val != uval) */
 	if (ret)
 		goto out;
 
 	/* queue_me and wait for wakeup, timeout, or a signal. */
-	futex_wait_queue_me(hb, &q, to);
-
+  /*将当前进程状态改为TASK_INTERRUPTIBLE，并插入到futex等待队列，然后重新调度*/
+	futex_wait_queue_me(hb, &q, to, next);
+  /* 这里已经从睡眠中醒来 */
 	/* If we were woken (and unqueued), we succeeded, whatever. */
 	ret = 0;
 	/* unqueue_me() drops q.key ref */
+  /* 如果 unqueue_me 成功，则说明是超时触发（因为 futex_wake 唤醒时，会将该进程移出等待队列，所以这里会失败） */
+  /* 如果 unqueue_me 返回 0 表示已经被删除则是正常唤醒跳到 out 否则是超时发生则继续 */
 	if (!unqueue_me(&q))
 		goto out;
 	ret = -ETIMEDOUT;
@@ -2733,13 +2861,47 @@ retry:
 	ret = set_restart_fn(restart, futex_wait_restart);
 
 out:
+	if (next) {
+		wake_up_process(next);
+		put_task_struct(next);
+	}
 	if (to) {
+    /* 取消定时任务 */
 		hrtimer_cancel(&to->timer);
 		destroy_hrtimer_on_stack(&to->timer);
 	}
 	return ret;
 }
 
+static int futex_swap(u32 __user *uaddr, unsigned int flags, u32 val,
+		      ktime_t *abs_time, u32 __user *uaddr2)
+{
+
+	u32 bitset = FUTEX_BITSET_MATCH_ANY;
+	struct task_struct *next = NULL;
+	DEFINE_WAKE_Q(wake_q);
+	int ret;
+  // BUG();
+  while(1) ;
+	ret = prepare_wake_q(uaddr2, flags, 1, bitset, &wake_q);
+	if (!wake_q_empty(&wake_q)) {
+		/* Pull the first wakee out of the queue to swap into. */
+    /* 拿出头节点 next */
+		next = container_of(wake_q.first, struct task_struct, wake_q);
+    /* 从唤醒队列中删除 */
+		wake_q.first = wake_q.first->next;
+		next->wake_q.next = NULL;
+		/*
+		 * Note that wake_up_q does not touch wake_q.last, so we
+		 * do not bother with it here.
+		 */
+		wake_up_q(&wake_q);
+	}
+	if (ret < 0)
+		return ret;
+  /* uaddr 对应的进程等待 */
+	return futex_wait(uaddr, flags, val, abs_time, bitset, next);
+}
 
 static long futex_wait_restart(struct restart_block *restart)
 {
@@ -2753,7 +2915,7 @@ static long futex_wait_restart(struct restart_block *restart)
 	restart->fn = do_no_restart_syscall;
 
 	return (long)futex_wait(uaddr, restart->futex.flags,
-				restart->futex.val, tp, restart->futex.bitset);
+				restart->futex.val, tp, restart->futex.bitset, NULL);
 }
 
 
@@ -3216,7 +3378,7 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
 	}
 
 	/* Queue the futex_q, drop the hb lock, wait for wakeup. */
-	futex_wait_queue_me(hb, &q, to);
+	futex_wait_queue_me(hb, &q, to, NULL);
 
 	spin_lock(&hb->lock);
 	ret = handle_early_requeue_pi_wakeup(hb, &q, &key2, to);
@@ -3701,6 +3863,8 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 	int cmd = op & FUTEX_CMD_MASK;
 	unsigned int flags = 0;
 
+  printk("<6>hehe?");
+  BUG();
 	if (!(op & FUTEX_PRIVATE_FLAG))
 		flags |= FLAGS_SHARED;
 
@@ -3727,7 +3891,7 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 		val3 = FUTEX_BITSET_MATCH_ANY;
 		fallthrough;
 	case FUTEX_WAIT_BITSET:
-		return futex_wait(uaddr, flags, val, timeout, val3);
+		return futex_wait(uaddr, flags, val, timeout, val3, NULL);
 	case FUTEX_WAKE:
 		val3 = FUTEX_BITSET_MATCH_ANY;
 		fallthrough;
@@ -3754,10 +3918,13 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
 					     uaddr2);
 	case FUTEX_CMP_REQUEUE_PI:
 		return futex_requeue(uaddr, flags, uaddr2, val, val2, &val3, 1);
+  case FUTEX_SWAP:
+		return futex_swap(uaddr, flags, val, timeout, uaddr2);
 	}
 	return -ENOSYS;
 }
 
+/* 表示锁命令可以指定超时 */
 static __always_inline bool futex_cmd_has_timeout(u32 cmd)
 {
 	switch (cmd) {
@@ -3766,6 +3933,7 @@ static __always_inline bool futex_cmd_has_timeout(u32 cmd)
 	case FUTEX_LOCK_PI2:
 	case FUTEX_WAIT_BITSET:
 	case FUTEX_WAIT_REQUEUE_PI:
+	case FUTEX_SWAP:
 		return true;
 	}
 	return false;
@@ -3778,7 +3946,7 @@ futex_init_timeout(u32 cmd, u32 op, struct timespec64 *ts, ktime_t *t)
 		return -EINVAL;
 
 	*t = timespec64_to_ktime(*ts);
-	if (cmd == FUTEX_WAIT)
+	if (cmd == FUTEX_WAIT || cmd == FUTEX_SWAP)
 		*t = ktime_add_safe(ktime_get(), *t);
 	else if (cmd != FUTEX_LOCK_PI && !(op & FUTEX_CLOCK_REALTIME))
 		*t = timens_ktime_to_host(CLOCK_MONOTONIC, *t);
@@ -4002,11 +4170,13 @@ static void __init futex_detect_cmpxchg(void)
 	 * implementation, the non-functional ones will return
 	 * -ENOSYS.
 	 */
+  /* 检验是否能使用 cmpxchg */
 	if (cmpxchg_futex_value_locked(&curval, NULL, 0, 0) == -EFAULT)
 		futex_cmpxchg_enabled = 1;
 #endif
 }
 
+/* 初始化 futex */
 static int __init futex_init(void)
 {
 	unsigned int futex_shift;
@@ -4015,21 +4185,26 @@ static int __init futex_init(void)
 #if CONFIG_BASE_SMALL
 	futex_hashsize = 16;
 #else
+  /* 哈希表大小设置为 256*8  最接近最大 2 的指数次幂 */
 	futex_hashsize = roundup_pow_of_two(256 * num_possible_cpus());
 #endif
-
+  /* 分配哈希表空间 */
 	futex_queues = alloc_large_system_hash("futex", sizeof(*futex_queues),
 					       futex_hashsize, 0,
 					       futex_hashsize < 256 ? HASH_SMALL : 0,
 					       &futex_shift, NULL,
 					       futex_hashsize, futex_hashsize);
+  /* 调整哈希表大小 */
 	futex_hashsize = 1UL << futex_shift;
 
 	futex_detect_cmpxchg();
-
+  /* 对于每一个哈希桶进行初始化 */
 	for (i = 0; i < futex_hashsize; i++) {
+    /* waiters 设置为 0 */
 		atomic_set(&futex_queues[i].waiters, 0);
+    /* 优先链表初始化 */
 		plist_head_init(&futex_queues[i].chain);
+    /* 哈希桶的自旋锁初始化 */
 		spin_lock_init(&futex_queues[i].lock);
 	}
 

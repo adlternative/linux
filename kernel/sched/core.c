@@ -864,12 +864,16 @@ static bool __wake_q_add(struct wake_q_head *head, struct task_struct *task)
 	 * state, even in the failed case, an explicit smp_mb() must be used.
 	 */
 	smp_mb__before_atomic();
+  /* if (node->next == NULL) node->next = WAKE_Q_TAIL
+    else return  node->next*/
+  /* 如果 node->next 不是 NULL 说明该任务节点已经在队列中了则返回错误 */
 	if (unlikely(cmpxchg_relaxed(&node->next, NULL, WAKE_Q_TAIL)))
 		return false;
 
 	/*
 	 * The head is context local, there can be no concurrency.
 	 */
+  /* 添加到 唤醒队列的结尾 */
 	*head->lastp = node;
 	head->lastp = &node->next;
 	return true;
@@ -916,6 +920,7 @@ void wake_q_add_safe(struct wake_q_head *head, struct task_struct *task)
 		put_task_struct(task);
 }
 
+/* 唤醒进程队列所有进程 */
 void wake_up_q(struct wake_q_head *head)
 {
 	struct wake_q_node *node = head->first;
